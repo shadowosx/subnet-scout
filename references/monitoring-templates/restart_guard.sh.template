@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# restart_guard — restart {{PROC_NAME}} if it is DOWN or STALLED, rate-limited so a
+# crash-looping miner doesn't get restarted forever. Uses pm2 (community standard);
+# a systemd fallback is shown in comments. Run from cron (e.g. */5 * * * *).
+# Instantiate by replacing {{...}} (see README.md).
+set -uo pipefail
+
+PROC_NAME="{{PROC_NAME}}"
+ALERT_CMD="{{ALERT_CMD}}"
+STATE_DIR="${HOME}/.subnet-scout/state"; mkdir -p "$STATE_DIR"
+STAMP="$STATE_DIR/restart_${PROC_NAME}.stamp"
+MIN_INTERVAL=900           # don't restart more than once per 15 min (anti-loop)
+MAX_PER_DAY=8              # hard cap; beyond this, alert and STOP restarting
+
+now="$(date +%s)"
+
+alert() { printf '%s\n' "[ALERT restart/$PROC_NAME] $1" | tee /dev/stderr | bash -c "$ALERT_CMD" || true; }
+
+# --- is it healthy? process up is necessary but NOT sufficient; see liveness_watcher ---
+if pgrep -f "$PROC_NAME" >/dev/null 2>&1; then
+  exit 0   # up; liveness_watcher handles "up but stalled" alerts
+fi
+
+# rate-limit
+if [ -f "$STAMP" ]; then
+  last="$(cut -d' ' -f1 "$STAMP" 2>/dev/null || echo 0)"
+  count="$(cut -d' ' -f2 "$STAMP" 2>/dev/null || echo 0)"
+  day="$(cut -d' ' -f3 "$STAMP" 2>/dev/null || echo '')"
+else
+  last=0; count=0; day=''
+fi
+today="$(date +%Y-%m-%d)"
+[ "$day" != "$today" ] && count=0   # reset daily counter
+
+if [ "$count" -ge "$MAX_PER_DAY" ]; then
+  alert "hit $MAX_PER_DAY restarts today — NOT restarting again. Investigate manually."
+  exit 1
+fi
+if [ $((now - last)) -lt "$MIN_INTERVAL" ]; then
+  echo "[restart_guard] within rate-limit window; skipping." >&2
+  exit 0
+fi
+
+alert "process DOWN — restarting (restart #$((count+1)) today)."
+pm2 restart "$PROC_NAME" 2>/dev/null || pm2 start "$PROC_NAME" 2>/dev/null
+# systemd fallback:  systemctl restart "$PROC_NAME" || true
+echo "$now $((count+1)) $today" > "$STAMP"

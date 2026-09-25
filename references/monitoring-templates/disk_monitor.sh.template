@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# disk_monitor — full disk silently corrupts checkpoints and kills miners.
+# Alerts when {{DISK_PATH}} usage exceeds {{DISK_THRESHOLD_PCT}}%.
+# Run from cron (e.g. */5 * * * *). Fails loudly; never hides a full disk.
+# Instantiate by replacing {{...}} (see README.md).
+set -euo pipefail
+
+DISK_PATH="{{DISK_PATH}}"
+THRESHOLD="{{DISK_THRESHOLD_PCT}}"
+ALERT_CMD="{{ALERT_CMD}}"   # receives the alert text on stdin
+
+# Portable usage % (Linux & macOS): strip the trailing % from df output.
+USAGE="$(df -P "$DISK_PATH" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+
+if [ -z "${USAGE:-}" ]; then
+  echo "[disk_monitor] ERROR: could not read disk usage for $DISK_PATH" >&2
+  exit 2
+fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] $DISK_PATH at ${USAGE}% (threshold ${THRESHOLD}%)"
+
+if [ "$USAGE" -ge "$THRESHOLD" ]; then
+  MSG="[ALERT disk] $DISK_PATH at ${USAGE}% >= ${THRESHOLD}% — checkpoints at risk."
+  echo "$MSG" >&2
+  printf '%s\n' "$MSG" | bash -c "$ALERT_CMD" || true
+  # --- Optional cleanup hook (review before enabling) ---
+  # find "$DISK_PATH"/checkpoints -name '*.tmp' -mtime +1 -delete
+  exit 1
+fi

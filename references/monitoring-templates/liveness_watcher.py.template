@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""
+liveness_watcher — catches the "alive but not actually working" trap.
+
+"Process up" is NOT "working." A miner can keep its process and axon up while its
+real work (training step, inference loop, indexing) has silently stalled — e.g. a
+dead worker masked by cached I/O that keeps serving a stale artifact. This watcher
+checks BOTH:
+  1. the process {{PROC_NAME}} is up, AND
+  2. the real WORK SIGNAL is progressing — {{WORK_SIGNAL_CMD}} must return either a
+     monotonically-increasing counter OR a freshness timestamp (epoch seconds).
+
+If the process is up but the work signal is stale, it ALERTS — this is the whole point.
+
+Pure stdlib. Fails loudly. Instantiate by replacing {{...}} (see README.md).
+"""
+import subprocess, sys, time, shlex
+
+PROC_NAME       = "{{PROC_NAME}}"
+WORK_SIGNAL_CMD = "{{WORK_SIGNAL_CMD}}"   # prints an int counter or epoch-seconds
+POLL_SECONDS    = int("{{POLL_SECONDS}}")
+ALERT_CMD       = "{{ALERT_CMD}}"
+
+STALL_TOLERANCE = 3          # alert after N polls with no progress / staleness
+# If the work signal looks like an epoch timestamp (> this), treat it as freshness:
+EPOCH_HEURISTIC = 1_000_000_000  # ~2001; values above this are interpreted as seconds
+
+
+def alert(msg: str) -> None:
+    line = f"[ALERT liveness/{PROC_NAME}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        subprocess.run(ALERT_CMD, shell=True, input=line + "\n", text=True, timeout=30)
+    except Exception as e:
+        print(f"[liveness] ALERT_CMD failed: {e}", file=sys.stderr, flush=True)
+
+
+def process_up() -> bool:
+    # pgrep is portable across Linux/macOS
+    r = subprocess.run(["pgrep", "-f", PROC_NAME], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() != ""
+
+
+def read_work_signal():
+    r = subprocess.run(WORK_SIGNAL_CMD, shell=True, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(f"work signal cmd failed rc={r.returncode}: {r.stderr.strip()[:200]}")
+    txt = r.stdout.strip().split()[-1] if r.stdout.strip() else ""
+    return float(txt)  # raises if not numeric → loud failure
+
+
+def main():
+    last_value = None
+    stall = 0
+    while True:
+        up = process_up()
+        if not up:
+            alert(f"process '{PROC_NAME}' is DOWN.")
+            stall = 0
+            last_value = None
+            time.sleep(POLL_SECONDS)
+            continue
+        try:
+            val = read_work_signal()
+        except Exception as e:
+            alert(f"process up but WORK SIGNAL unreadable ({e}) — possible stall.")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        now = time.time()
+        if val > EPOCH_HEURISTIC:
+            # freshness mode: val is a timestamp; stale if older than 2 poll windows
+            age = now - val
+            print(f"[{time.strftime('%H:%M:%S')}] up=1 work_ts_age={age:.0f}s", flush=True)
+            if age > 2 * POLL_SECONDS:
+                stall += 1
+            else:
+                stall = 0
+        else:
+            # counter mode: must strictly increase
+            print(f"[{time.strftime('%H:%M:%S')}] up=1 work_counter={val:.0f}", flush=True)
+            if last_value is not None and val <= last_value:
+                stall += 1
+            else:
+                stall = 0
+            last_value = val
+
+        if stall >= STALL_TOLERANCE:
+            alert(f"process '{PROC_NAME}' is UP but work signal has not progressed "
+                  f"for {stall} polls — ALIVE BUT NOT WORKING.")
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+# subnet-research.py dependencies
+#
+# The core script uses only the Python standard library (argparse, json, os,
+# sys, time, urllib, datetime). No third-party package is required for the
+# taostats + GitHub providers.
+
+# requests is listed for parity with the wider skill tooling and any future
+# providers that prefer it over urllib; the current script does not import it.
+requests>=2.28
+
+# OPTIONAL: Desearch off-chain signals. The script degrades gracefully when
+# this is absent (emits "Desearch unavailable: pip install desearch-py" to
+# stderr and continues with desearch=null). Install only if you want Desearch
+# signals in the report.
+# desearch-py

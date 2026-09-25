@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+rank_earnings_watcher — the ONLY ground truth for "am I earning?"
+
+Polls the on-chain metagraph for hotkey {{HOTKEY_SS58}} on subnet {{NETUID}}
+every {{POLL_SECONDS}}s and logs incentive / emission / rank / trust. Alerts via
+{{ALERT_CMD}} when earnings look broken.
+
+Pure stdlib (no `bittensor` import) — parses `btcli subnet show --json-output`.
+Fails LOUDLY: a poll that can't read the chain prints to stderr and is recorded
+as an explicit gap, never silently treated as "fine".
+
+Instantiate by replacing the {{...}} tokens (see README.md).
+"""
+import json, subprocess, sys, time, shlex
+
+NETUID       = "{{NETUID}}"
+HOTKEY_SS58  = "{{HOTKEY_SS58}}"
+BTCLI        = "{{BTCLI}}"            # resolved btcli path/invocation
+POLL_SECONDS = int("{{POLL_SECONDS}}")
+ALERT_CMD    = "{{ALERT_CMD}}"        # receives the alert text on stdin
+
+ZERO_EMISSION_ALERT_CYCLES = 2        # alert after N consecutive zero-emission polls
+
+
+def alert(msg: str) -> None:
+    line = f"[ALERT sn{NETUID}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        subprocess.run(ALERT_CMD, shell=True, input=line + "\n",
+                       text=True, timeout=30)
+    except Exception as e:  # an alert channel that fails must not kill the watcher
+        print(f"[watcher] ALERT_CMD failed: {e}", file=sys.stderr, flush=True)
+
+
+def fetch_neurons():
+    """Return list of per-UID dicts, or raise on failure (no fabrication)."""
+    cmd = shlex.split(BTCLI) + ["subnet", "show", "--netuid", NETUID, "--json-output"]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        raise RuntimeError(f"btcli failed rc={out.returncode}: {out.stderr.strip()[:300]}")
+    # btcli --json-output can embed raw newlines in string fields → strict=False
+    data = json.loads(out.stdout, strict=False)
+    # tolerate a few shapes: {"neurons":[...]} | {"metagraph":{"neurons":[...]}} | [...]
+    for path in (("neurons",), ("metagraph", "neurons"), ()):
+        node = data
+        ok = True
+        for k in path:
+            if isinstance(node, dict) and k in node:
+                node = node[k]
+            else:
+                ok = False
+                break
+        if ok and isinstance(node, list):
+            return node
+    raise RuntimeError("could not locate neuron list in btcli JSON — adjust parser for your btcli version")
+
+
+def find_me(neurons):
+    for n in neurons:
+        hk = n.get("hotkey") or n.get("hotkey_ss58") or n.get("ss58") or ""
+        if hk == HOTKEY_SS58:
+            return n
+    return None
+
+
+def num(n, *keys, default=0.0):
+    for k in keys:
+        if k in n and n[k] is not None:
+            try:
+                return float(n[k])
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
+def main():
+    zero_streak = 0
+    while True:
+        try:
+            neurons = fetch_neurons()
+            me = find_me(neurons)
+            if me is None:
+                alert(f"hotkey {HOTKEY_SS58[:8]}… NOT in metagraph — not registered or deregistered!")
+                zero_streak = 0
+            else:
+                uid       = me.get("uid")
+                incentive = num(me, "incentive")
+                emission  = num(me, "emission")
+                rank      = num(me, "rank")
+                trust     = num(me, "trust")
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] uid={uid} "
+                      f"incentive={incentive:.6f} emission={emission:.6f} "
+                      f"rank={rank:.4f} trust={trust:.4f}", flush=True)
+
+                # near-deregistration check: lowest non-immune emission in the subnet
+                emissions = sorted(num(x, "emission") for x in neurons)
+                cutoff = emissions[0] if emissions else 0.0
+                if emission <= cutoff and len(neurons) >= 256:
+                    alert(f"uid={uid} at/below the deregistration emission floor ({cutoff:.6f}) — at risk!")
+
+                if emission <= 0.0:
+                    zero_streak += 1
+                    if zero_streak >= ZERO_EMISSION_ALERT_CYCLES:
+                        alert(f"uid={uid} emission==0 for {zero_streak} polls — earning nothing.")
+                else:
+                    zero_streak = 0
+        except Exception as e:
+            # loud failure — a blind watcher is worse than none
+            print(f"[watcher] poll failed: {e}", file=sys.stderr, flush=True)
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
